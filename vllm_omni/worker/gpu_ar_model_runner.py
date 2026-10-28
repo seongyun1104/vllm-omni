@@ -2292,7 +2292,8 @@ class GPUARModelRunner(
                 if input_fits_in_drafter:
                     propose_draft_token_ids(sampled_token_ids)
                 elif self.valid_sampled_token_count_event is not None:
-                    assert spec_decode_common_attn_metadata is not None
+                    # The third result is a discard-masked clone for n-gram;
+                    # bookkeeping/MTP retain the original sampler tensor.
                     next_token_ids, valid_sampled_tokens_count, _ = self.drafter.update_token_ids_ngram(
                         sampled_token_ids,
                         self.input_batch,
@@ -2305,8 +2306,7 @@ class GPUARModelRunner(
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
             if not input_fits_in_drafter:
-                # Match upstream's shared cleanup, including GPU n-gram:
-                # the next step must not consume stale optimistic drafts.
+                # Intentionally broader than old GPU/count-event arm: includes CPU n-gram and no-event Eagle/draft.
                 self._draft_token_ids = torch.zeros(1, device=self.device, dtype=torch.int32).expand(
                     len(self.input_batch.req_ids), self.num_spec_tokens
                 )

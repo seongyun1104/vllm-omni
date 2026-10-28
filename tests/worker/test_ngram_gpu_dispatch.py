@@ -26,7 +26,7 @@ def _runner(monkeypatch, *, method, async_scheduling, fits=True, count_event=Tru
         SimpleNamespace(total_num_scheduled_tokens=3),
         None,
         None,
-        object(),
+        None if method == "ngram_gpu" and not fits else object(),
         torch.zeros((3, 2)),
         None,
         torch.zeros((2, 2)),
@@ -43,8 +43,8 @@ def _runner(monkeypatch, *, method, async_scheduling, fits=True, count_event=Tru
     runner.broadcast_pp_output = False
     runner.kv_connector_output = None
     runner.speculative_config = SimpleNamespace(
-        use_eagle=lambda: False,
-        uses_draft_model=lambda: False,
+        use_eagle=lambda: method == "eagle",
+        uses_draft_model=lambda: method == "draft",
         uses_extract_hidden_states=lambda: False,
         use_ngram_gpu=lambda: method == "ngram_gpu",
         disable_padded_drafter_batch=not padded,
@@ -54,14 +54,23 @@ def _runner(monkeypatch, *, method, async_scheduling, fits=True, count_event=Tru
     runner._draft_probs = object()
     runner._draft_prob_req_ids = ["old-request"]
     runner.valid_sampled_token_count_event = object() if count_event else None
-    runner.drafter = object.__new__(NgramProposerGPU) if method == "ngram_gpu" else SimpleNamespace()
+    proposer_type = {"ngram_gpu": NgramProposerGPU, "eagle": ar.EagleProposer, "draft": ar.DraftModelProposer}.get(
+        method
+    )
+    runner.drafter = object.__new__(proposer_type) if proposer_type else SimpleNamespace()
     runner.token_ids_gpu_tensor = torch.tensor([[7, 8], [9, 10]], dtype=torch.int32)
     runner.num_tokens_no_spec_gpu = torch.tensor([1, 1], dtype=torch.int32)
     runner.discard_request_mask = SimpleNamespace(gpu=torch.tensor([False, True]))
     runner._sample = lambda *args: SimpleNamespace(sampled_token_ids=sampled)
     runner._update_states_after_model_execute = lambda *args: None
     runner._input_fits_in_drafter = lambda *args: fits
-    runner._run_post_sample_talker_mtp = lambda **kwargs: kwargs["multimodal_outputs"]
+
+    def post_sample_mtp(**kwargs):
+        assert kwargs["sampled_token_ids"] is sampled
+        assert sampled.tolist() == [[11, -1], [22, 23]]
+        return kwargs["multimodal_outputs"]
+
+    runner._run_post_sample_talker_mtp = post_sample_mtp
     runner.finalize_kv_connector = lambda: events.append(("finalize_kv", None))
     runner.eplb_step = lambda: None
 
@@ -69,7 +78,9 @@ def _runner(monkeypatch, *, method, async_scheduling, fits=True, count_event=Tru
         events.append(("propose", tokens))
         return [[31], [32]]
 
-    def bookkeep(*args):
+    def bookkeep(_scheduler, sampler_output, *args):
+        assert sampler_output.sampled_token_ids is sampled
+        assert sampled.tolist() == [[11, -1], [22, 23]]
         events.append(("bookkeep", None))
         return 0, None, None, cpu_rows, None, ["a", "b"], {"a": 0, "b": 1}, []
 
@@ -91,7 +102,9 @@ def _runner(monkeypatch, *, method, async_scheduling, fits=True, count_event=Tru
         assert num_tokens is runner.num_tokens_no_spec_gpu
         assert discard is runner.discard_request_mask.gpu
         events.append(("update_ngram", tokens))
-        return torch.tensor([11, 9]), torch.tensor([1, 0]), sampled
+        masked = tokens.clone()
+        masked[discard] = -1
+        return torch.tensor([11, 9]), torch.tensor([1, 0]), masked
 
     def copy_counts(next_ids, counts):
         assert next_ids.tolist() == [11, 9]
@@ -147,3 +160,14 @@ def test_cpu_list_dispatch_stays_after_bookkeeping(monkeypatch, method, padded):
         runner.sample_tokens(None)
     assert [event for event, _ in events] == ["bookkeep", "propose", "copy_drafts", "finalize_kv"]
     assert events[1][1] is cpu_rows
+
+
+@pytest.mark.parametrize("method", ["eagle", "draft"])
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_gpu_proposer_false_fit_without_count_event_clears_drafts(monkeypatch, method, async_scheduling):
+    runner, _, _, events = _runner(
+        monkeypatch, method=method, async_scheduling=async_scheduling, fits=False, count_event=False
+    )
+    with pytest.raises(_DispatchCompleteError):
+        runner.sample_tokens(None)
+    assert [event for event, _ in events] == ["copy_zeros", "bookkeep", "finalize_kv"]
